@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -16,6 +17,7 @@ import androidx.lifecycle.lifecycleScope
 import codes.dreaming.cloudmedia.R
 import codes.dreaming.cloudmedia.databinding.ActivityLoginBinding
 import codes.dreaming.cloudmedia.network.ApiClient
+import codes.dreaming.cloudmedia.network.ImmichRepository
 import codes.dreaming.cloudmedia.util.ShizukuHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -59,7 +61,7 @@ class LoginActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ApiClient.initialize(this)
+        ImmichRepository.initialize(this)
 
         binding = ActivityLoginBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -222,7 +224,7 @@ class LoginActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             val result = withContext(Dispatchers.IO) {
-                if (useApiKey) {
+                val loginResult = if (useApiKey) {
                     val apiKey = binding.apiKeyInput.text?.toString()?.trim() ?: ""
                     ApiClient.loginWithApiKey(serverUrl, apiKey)
                 } else {
@@ -230,20 +232,40 @@ class LoginActivity : AppCompatActivity() {
                     val password = binding.passwordInput.text?.toString() ?: ""
                     ApiClient.loginWithCredentials(serverUrl, email, password)
                 }
+                if (loginResult.isSuccess) ImmichRepository.resetForAccountChange()
+                loginResult
             }
 
             setLoading(false)
 
             result.fold(
-                onSuccess = { updateUiState() },
+                onSuccess = {
+                    notifyMediaChanged()
+                    ImmichRepository.requestRefresh(::notifyMediaChanged)
+                    updateUiState()
+                },
                 onFailure = { e -> showError(getString(R.string.login_error, e.message)) }
             )
         }
     }
 
     private fun performLogout() {
+        ImmichRepository.resetForAccountChange()
         ApiClient.logout()
+        notifyMediaChanged()
         updateUiState()
+    }
+
+    private fun notifyMediaChanged() {
+        try {
+            MediaStore.notifyCloudMediaChangedEvent(
+                contentResolver,
+                packageName + ".cloudmedia",
+                ImmichRepository.getMediaCollectionId()
+            )
+        } catch (_: Exception) {
+            // The provider may not be selected yet; its next collection query will resync.
+        }
     }
 
     private fun setLoading(loading: Boolean) {

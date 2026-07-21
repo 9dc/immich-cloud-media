@@ -10,6 +10,7 @@ import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.CloudMediaProvider
 import android.provider.CloudMediaProviderContract
+import android.provider.MediaStore
 import android.util.Log
 import androidx.annotation.RequiresApi
 import codes.dreaming.cloudmedia.network.ImmichRepository
@@ -28,7 +29,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   override fun onCreate(): Boolean {
     val ctx = context ?: return false
     ImmichRepository.initialize(ctx)
-    ImmichRepository.detectAndApplyChanges()
+    ImmichRepository.requestRefresh(::notifyMediaChanged)
     return true
   }
 
@@ -36,10 +37,9 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     checkPermission()
     Log.d(TAG, "onGetMediaCollectionInfo called")
 
-    val changed = ImmichRepository.detectAndApplyChanges()
-    if (changed) {
-      context?.contentResolver?.notifyChange(toNotifyUri(), null)
-    }
+    // Collection-info is performance critical. Refresh remotely in the
+    // background and notify MediaProvider if the durable snapshot changes.
+    ImmichRepository.requestRefresh(::notifyMediaChanged)
 
     val bundle = Bundle()
     bundle.putString(
@@ -102,10 +102,13 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     }
     val honoredArgs = arrayListOf(
       CloudMediaProviderContract.EXTRA_PAGE_SIZE,
-      CloudMediaProviderContract.EXTRA_PAGE_TOKEN,
-      CloudMediaProviderContract.EXTRA_SYNC_GENERATION
+      CloudMediaProviderContract.EXTRA_PAGE_TOKEN
     )
-    if (albumId != null) honoredArgs.add(CloudMediaProviderContract.EXTRA_ALBUM_ID)
+    if (albumId != null) {
+      honoredArgs.add(CloudMediaProviderContract.EXTRA_ALBUM_ID)
+    } else {
+      honoredArgs.add(CloudMediaProviderContract.EXTRA_SYNC_GENERATION)
+    }
     cursorExtras.putStringArrayList(ContentResolver.EXTRA_HONORED_ARGS, honoredArgs)
     cursor.extras = cursorExtras
 
@@ -115,18 +118,25 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   override fun onQueryDeletedMedia(extras: Bundle): Cursor {
     checkPermission()
     val syncGeneration = extras.getLong(CloudMediaProviderContract.EXTRA_SYNC_GENERATION, 0)
-    val deletedIds = ImmichRepository.queryDeletedAssets(syncGeneration)
+    val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
+    val result = ImmichRepository.queryDeletedAssets(syncGeneration, pageToken)
     val cursor = MatrixCursor(arrayOf(CloudMediaProviderContract.MediaColumns.ID))
-    for (id in deletedIds) cursor.addRow(arrayOf(id))
+    for (id in result.ids) cursor.addRow(arrayOf(id))
 
     val cursorExtras = Bundle()
     cursorExtras.putString(
       CloudMediaProviderContract.EXTRA_MEDIA_COLLECTION_ID,
       ImmichRepository.getMediaCollectionId()
     )
+    if (result.nextPageToken != null) {
+      cursorExtras.putString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN, result.nextPageToken)
+    }
     cursorExtras.putStringArrayList(
       ContentResolver.EXTRA_HONORED_ARGS,
-      arrayListOf(CloudMediaProviderContract.EXTRA_SYNC_GENERATION)
+      arrayListOf(
+        CloudMediaProviderContract.EXTRA_SYNC_GENERATION,
+        CloudMediaProviderContract.EXTRA_PAGE_TOKEN
+      )
     )
     cursor.extras = cursorExtras
     return cursor
@@ -145,10 +155,6 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     cursorExtras.putString(
       CloudMediaProviderContract.EXTRA_MEDIA_COLLECTION_ID,
       ImmichRepository.getMediaCollectionId()
-    )
-    cursorExtras.putStringArrayList(
-      ContentResolver.EXTRA_HONORED_ARGS,
-      arrayListOf(CloudMediaProviderContract.EXTRA_SYNC_GENERATION)
     )
     cursor.extras = cursorExtras
     return cursor
@@ -260,7 +266,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   ): ParcelFileDescriptor {
     checkPermission()
     Log.d(TAG, "onOpenMedia: mediaId=$mediaId")
-    return ImmichRepository.openMedia(mediaId)
+    return ImmichRepository.openMedia(mediaId, cancellationSignal)
       ?: throw FileNotFoundException("Failed to open media: $mediaId")
   }
 
@@ -273,7 +279,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   ): AssetFileDescriptor {
     checkPermission()
     Log.d(TAG, "onOpenPreview: mediaId=$mediaId size=${size.x}x${size.y}")
-    val fd = ImmichRepository.openPreview(mediaId, size)
+    val fd = ImmichRepository.openPreview(mediaId, size, cancellationSignal)
       ?: throw FileNotFoundException("Failed to open preview: $mediaId")
     return AssetFileDescriptor(fd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
   }
@@ -295,7 +301,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
           asset.id,
           asset.mimeType,
           asset.dateTakenMillis,
-          ImmichRepository.getLastSyncGeneration(),
+          asset.syncGeneration.takeIf { it > 0 } ?: ImmichRepository.getLastSyncGeneration(),
           asset.sizeBytes,
           if (asset.durationMillis > 0) asset.durationMillis else null,
           if (asset.isFavorite) 1 else 0,
@@ -319,9 +325,18 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     return extras
   }
 
-  private fun toNotifyUri(): android.net.Uri {
-    val authority = context!!.packageName + ".cloudmedia"
-    return android.net.Uri.parse("content://$authority")
+  private fun notifyMediaChanged() {
+    val ctx = context ?: return
+    val authority = ctx.packageName + ".cloudmedia"
+    try {
+      MediaStore.notifyCloudMediaChangedEvent(
+        ctx.contentResolver,
+        authority,
+        ImmichRepository.getMediaCollectionId()
+      )
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to notify MediaStore about Immich changes", e)
+    }
   }
 
   private fun checkPermission() {

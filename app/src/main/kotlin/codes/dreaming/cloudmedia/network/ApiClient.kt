@@ -102,6 +102,7 @@ object ApiClient {
   fun loginWithCredentials(serverUrl: String, email: String, password: String): Result<String> {
     return try {
       this.serverUrl = serverUrl
+      prefs.edit().remove(KEY_API_KEY).remove(KEY_ACCESS_TOKEN).apply()
       val url = buildUrl("/auth/login") ?: return Result.failure(Exception("Invalid server URL"))
       val body = JSONObject().apply {
         put("email", email)
@@ -135,6 +136,7 @@ object ApiClient {
   fun loginWithApiKey(serverUrl: String, apiKey: String): Result<String> {
     return try {
       this.serverUrl = serverUrl
+      prefs.edit().remove(KEY_ACCESS_TOKEN).apply()
       saveApiKey(apiKey)
       val url = buildUrl("/users/me") ?: return Result.failure(Exception("Invalid server URL"))
       val request = Request.Builder().url(url).get().build()
@@ -148,6 +150,10 @@ object ApiClient {
         return Result.failure(Exception(msg))
       }
       val json = JSONObject(responseBody)
+      validateApiKeyMediaAccess().getOrElse {
+        prefs.edit().remove(KEY_API_KEY).apply()
+        return Result.failure(it)
+      }
       val name = json.optString("name", "")
       val email = json.optString("email", "")
       accountName = when {
@@ -161,6 +167,35 @@ object ApiClient {
       Log.e(TAG, "loginWithApiKey error", e)
       Result.failure(e)
     }
+  }
+
+  private fun validateApiKeyMediaAccess(): Result<Unit> {
+    val searchUrl = buildUrl("/search/metadata")
+      ?: return Result.failure(Exception("Invalid server URL"))
+    val searchBody = JSONObject().apply {
+      put("page", 1)
+      put("size", 1)
+    }
+    val checks = listOf(
+      Request.Builder()
+        .url(searchUrl)
+        .post(searchBody.toString().toRequestBody("application/json".toMediaType()))
+        .build() to "asset.read",
+      Request.Builder()
+        .url(buildUrl("/albums") ?: return Result.failure(Exception("Invalid server URL")))
+        .get()
+        .build() to "album.read"
+    )
+    for ((request, permission) in checks) {
+      client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) {
+          return Result.failure(
+            Exception("API key needs the $permission permission (HTTP ${response.code})")
+          )
+        }
+      }
+    }
+    return Result.success(Unit)
   }
 
   private fun fetchAndSaveAccountName() {

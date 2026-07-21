@@ -6,9 +6,9 @@ An Android Cloud Media Provider that integrates your self-hosted [Immich](https:
 
 ## Installation
 
-[<img src="https://github.com/ImranR98/Obtainium/raw/main/assets/graphics/badge_obtainium.png" alt="Get it on Obtainium" height="56">](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22codes.dreaming.cloudmedia%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FDreaming-Codes%2Fimmich-cloud-media%22%2C%22author%22%3A%22Dreaming-Codes%22%2C%22name%22%3A%22Immich%20Cloud%20Photos%22%2C%22additionalSettings%22%3A%22%7B%5C%22about%5C%22%3A%5C%22Cloud%20Media%20Provider%20for%20Immich%5C%22%7D%22%7D)
+[<img src="https://github.com/ImranR98/Obtainium/raw/main/assets/graphics/badge_obtainium.png" alt="Get it on Obtainium" height="56">](https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22codes.dreaming.cloudmedia%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2F9dc%2Fimmich-cloud-media%22%2C%22author%22%3A%229dc%22%2C%22name%22%3A%22Immich%20Cloud%20Photos%22%2C%22additionalSettings%22%3A%22%7B%5C%22about%5C%22%3A%5C%22Cloud%20Media%20Provider%20for%20Immich%5C%22%7D%22%7D)
 
-Or download the latest APK from the [Releases](https://github.com/Dreaming-Codes/immich-cloud-media/releases) page.
+Or download the latest APK from the [Releases](https://github.com/9dc/immich-cloud-media/releases) page.
 
 ## Requirements
 

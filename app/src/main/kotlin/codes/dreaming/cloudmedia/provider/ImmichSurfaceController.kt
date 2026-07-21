@@ -13,7 +13,6 @@ import android.provider.CloudMediaProviderContract
 import android.util.Log
 import android.view.Surface
 import codes.dreaming.cloudmedia.network.ImmichRepository
-import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 private const val TAG = "ImmichSurface"
@@ -28,7 +27,10 @@ class ImmichSurfaceController(
     var surface: Surface? = null,
     var mediaId: String? = null,
     var player: MediaPlayer? = null,
-    var isPrepared: Boolean = false
+    var mediaDescriptor: ParcelFileDescriptor? = null,
+    var isPrepared: Boolean = false,
+    var playWhenReady: Boolean = false,
+    var released: Boolean = false
   )
 
   private val players = ConcurrentHashMap<Int, PlayerState>()
@@ -64,31 +66,37 @@ class ImmichSurfaceController(
 
   override fun onMediaPlay(surfaceId: Int) {
     val state = players[surfaceId] ?: return
-    if (state.isPrepared) {
-      try {
-        state.player?.start()
-        callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_STARTED, null)
-      } catch (e: Exception) {
-        Log.e(TAG, "Error starting playback for surface $surfaceId", e)
-        reportError(surfaceId)
+    synchronized(state) {
+      state.playWhenReady = true
+      if (state.isPrepared) {
+        try {
+          state.player?.start()
+          callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_STARTED, null)
+        } catch (e: Exception) {
+          Log.e(TAG, "Error starting playback for surface $surfaceId", e)
+          reportError(surfaceId)
+        }
       }
     }
   }
 
   override fun onMediaPause(surfaceId: Int) {
     val state = players[surfaceId] ?: return
-    try {
-      state.player?.pause()
-      callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_PAUSED, null)
-    } catch (e: Exception) {
-      Log.e(TAG, "Error pausing playback for surface $surfaceId", e)
+    synchronized(state) {
+      state.playWhenReady = false
+      try {
+        if (state.isPrepared) state.player?.pause()
+        callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_PAUSED, null)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error pausing playback for surface $surfaceId", e)
+      }
     }
   }
 
   override fun onMediaSeekTo(surfaceId: Int, timestampMillis: Long) {
     val state = players[surfaceId] ?: return
     try {
-      state.player?.seekTo(timestampMillis.toInt())
+      state.player?.seekTo(timestampMillis, MediaPlayer.SEEK_CLOSEST)
     } catch (e: Exception) {
       Log.e(TAG, "Error seeking for surface $surfaceId", e)
     }
@@ -109,21 +117,18 @@ class ImmichSurfaceController(
     val mediaId = state.mediaId ?: return
     val surface = state.surface ?: return
     releasePlayer(state)
+    synchronized(state) {
+      state.released = false
+      state.surface = surface
+      state.mediaId = mediaId
+    }
 
     callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_BUFFERING, null)
 
     Thread {
       try {
-        val tempFile = File(context.cacheDir, "video_$mediaId.tmp")
-        val fd = ImmichRepository.openMedia(mediaId)
+        val fd = ImmichRepository.openVideoPlayback(mediaId)
         if (fd == null) {
-          reportError(surfaceId)
-          return@Thread
-        }
-        ParcelFileDescriptor.AutoCloseInputStream(fd).use { input ->
-          tempFile.outputStream().use { output -> input.copyTo(output, 65536) }
-        }
-        if (!tempFile.exists() || tempFile.length() == 0L) {
           reportError(surfaceId)
           return@Thread
         }
@@ -136,18 +141,25 @@ class ImmichSurfaceController(
             .build()
         )
         player.setSurface(surface)
-        player.setDataSource(tempFile.absolutePath)
+        player.setDataSource(fd.fileDescriptor)
         player.isLooping = loopingEnabled
         val volume = if (audioMuted) 0f else 1f
         player.setVolume(volume, volume)
 
         player.setOnPreparedListener { mp ->
-          state.isPrepared = true
-          val sizeBundle = Bundle().apply {
-            putParcelable(ContentResolver.EXTRA_SIZE, Point(mp.videoWidth, mp.videoHeight))
+          synchronized(state) {
+            if (state.released || players[surfaceId] !== state) return@setOnPreparedListener
+            state.isPrepared = true
+            val sizeBundle = Bundle().apply {
+              putParcelable(ContentResolver.EXTRA_SIZE, Point(mp.videoWidth, mp.videoHeight))
+            }
+            callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_MEDIA_SIZE_CHANGED, sizeBundle)
+            callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_READY, null)
+            if (state.playWhenReady) {
+              mp.start()
+              callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_STARTED, null)
+            }
           }
-          callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_MEDIA_SIZE_CHANGED, sizeBundle)
-          callback.setPlaybackState(surfaceId, CloudMediaSurfaceStateChangedCallback.PLAYBACK_STATE_READY, null)
         }
         player.setOnErrorListener { _, what, extra ->
           Log.e(TAG, "MediaPlayer error: what=$what extra=$extra for $mediaId")
@@ -160,8 +172,16 @@ class ImmichSurfaceController(
           }
         }
 
-        state.player = player
-        player.prepareAsync()
+        synchronized(state) {
+          if (state.released || players[surfaceId] !== state) {
+            player.release()
+            fd.close()
+            return@Thread
+          }
+          state.player = player
+          state.mediaDescriptor = fd
+          player.prepareAsync()
+        }
       } catch (e: Exception) {
         Log.e(TAG, "Error preparing player for surface $surfaceId", e)
         reportError(surfaceId)
@@ -170,9 +190,15 @@ class ImmichSurfaceController(
   }
 
   private fun releasePlayer(state: PlayerState) {
-    try { state.player?.release() } catch (e: Exception) { Log.e(TAG, "Error releasing player", e) }
-    state.player = null
-    state.isPrepared = false
+    synchronized(state) {
+      state.released = true
+      try { state.player?.release() } catch (e: Exception) { Log.e(TAG, "Error releasing player", e) }
+      try { state.mediaDescriptor?.close() } catch (e: Exception) { Log.e(TAG, "Error closing media", e) }
+      state.player = null
+      state.mediaDescriptor = null
+      state.isPrepared = false
+      state.playWhenReady = false
+    }
   }
 
   private fun reportError(surfaceId: Int) {

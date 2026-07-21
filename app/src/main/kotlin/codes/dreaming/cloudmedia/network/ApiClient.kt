@@ -176,23 +176,37 @@ object ApiClient {
       put("page", 1)
       put("size", 1)
     }
-    val checks = listOf(
-      Request.Builder()
-        .url(searchUrl)
-        .post(searchBody.toString().toRequestBody("application/json".toMediaType()))
-        .build() to "asset.read",
+    val searchRequest = Request.Builder()
+      .url(searchUrl)
+      .post(searchBody.toString().toRequestBody("application/json".toMediaType()))
+      .build()
+    val sampleAssetId = client.newCall(searchRequest).execute().use { response ->
+      val body = response.body?.string() ?: "{}"
+      if (!response.isSuccessful) {
+        return Result.failure(Exception("API key needs asset.read permission (HTTP ${response.code})"))
+      }
+      JSONObject(body).optJSONObject("assets")?.optJSONArray("items")
+        ?.optJSONObject(0)?.optString("id")?.takeIf { it.isNotBlank() }
+    }
+
+    val checks = mutableListOf(
       Request.Builder()
         .url(buildUrl("/albums") ?: return Result.failure(Exception("Invalid server URL")))
-        .get()
-        .build() to "album.read"
+        .get().build() to "album.read"
     )
+    if (sampleAssetId != null) {
+      checks += Request.Builder()
+        .url(buildUrl("/assets/$sampleAssetId/thumbnail") ?: return Result.failure(Exception("Invalid server URL")))
+        .get().build() to "asset.view"
+      checks += Request.Builder()
+        .url(buildUrl("/assets/$sampleAssetId/original") ?: return Result.failure(Exception("Invalid server URL")))
+        .header("Range", "bytes=0-0").get().build() to "asset.download"
+    }
     for ((request, permission) in checks) {
       client.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) {
-          return Result.failure(
-            Exception("API key needs the $permission permission (HTTP ${response.code})")
-          )
-        }
+        if (!response.isSuccessful) return Result.failure(
+          Exception("API key needs $permission permission (HTTP ${response.code})")
+        )
       }
     }
     return Result.success(Unit)

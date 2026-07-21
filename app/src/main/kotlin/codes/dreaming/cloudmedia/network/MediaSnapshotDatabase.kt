@@ -118,15 +118,35 @@ internal class MediaSnapshotDatabase(context: Context) :
     return true
   }
 
-  fun queryAssets(syncGeneration: Long, pageSize: Int, pageToken: String?): QueryResult {
+  fun queryAssets(
+    syncGeneration: Long,
+    pageSize: Int,
+    pageToken: String?,
+    mimeTypes: List<String> = emptyList()
+  ): QueryResult {
     val size = pageSize.coerceIn(1, MAX_PAGE_SIZE)
     val (upperGeneration, offset) = parseJournalPageToken(pageToken)
+    val selection = mutableListOf("sync_generation > ?", "sync_generation <= ?")
+    val selectionArgs = mutableListOf(syncGeneration.toString(), upperGeneration.toString())
+    val requestedTypes = mimeTypes.filter { it.isNotBlank() && it != "*/*" }.distinct()
+    if (requestedTypes.isNotEmpty()) {
+      val mimeClauses = requestedTypes.map { mimeType ->
+        if (mimeType.endsWith("/*")) {
+          selectionArgs += mimeType.removeSuffix("*") + "%"
+          "mime_type LIKE ?"
+        } else {
+          selectionArgs += mimeType
+          "mime_type = ?"
+        }
+      }
+      selection += mimeClauses.joinToString(" OR ", prefix = "(", postfix = ")")
+    }
     val assets = mutableListOf<ImmichAsset>()
     readableDatabase.query(
       "assets",
       ASSET_COLUMNS,
-      "sync_generation > ? AND sync_generation <= ?",
-      arrayOf(syncGeneration.toString(), upperGeneration.toString()),
+      selection.joinToString(" AND "),
+      selectionArgs.toTypedArray(),
       null,
       null,
       "date_taken DESC, id DESC",
@@ -141,6 +161,17 @@ internal class MediaSnapshotDatabase(context: Context) :
       if (hasMore) "$upperGeneration:${offset + size}" else null
     )
   }
+
+  fun getAsset(id: String): ImmichAsset? = readableDatabase.query(
+    "assets",
+    ASSET_COLUMNS,
+    "id = ?",
+    arrayOf(id),
+    null,
+    null,
+    null,
+    "1"
+  ).use { cursor -> if (cursor.moveToFirst()) cursor.toAsset() else null }
 
   fun queryDeleted(syncGeneration: Long, pageToken: String?): DeletedQueryResult {
     val (upperGeneration, offset) = parseJournalPageToken(pageToken)

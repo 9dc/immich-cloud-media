@@ -1,6 +1,7 @@
 package codes.dreaming.cloudmedia.provider
 
 import android.content.ContentResolver
+import android.content.Intent
 import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
@@ -83,11 +84,21 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     val albumId = extras.getString(CloudMediaProviderContract.EXTRA_ALBUM_ID)
     val pageSize = extras.getInt(CloudMediaProviderContract.EXTRA_PAGE_SIZE, 1000)
     val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
+    val mimeTypes = extras.getStringArray(Intent.EXTRA_MIME_TYPES)?.toList().orEmpty()
 
     val result = if (albumId != null) {
-      ImmichRepository.queryAlbumAssets(albumId = albumId, pageSize = pageSize, pageToken = pageToken)
+      ImmichRepository.queryAlbumAssets(
+        albumId = albumId,
+        pageSize = pageSize,
+        pageToken = pageToken
+      ).filterMimeTypes(mimeTypes)
     } else {
-      ImmichRepository.queryAllAssets(syncGeneration = syncGeneration, pageSize = pageSize, pageToken = pageToken)
+      ImmichRepository.queryAllAssets(
+        syncGeneration = syncGeneration,
+        pageSize = pageSize,
+        pageToken = pageToken,
+        mimeTypes = mimeTypes
+      )
     }
 
     val cursor = buildMediaCursor(result)
@@ -108,6 +119,14 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
       honoredArgs.add(CloudMediaProviderContract.EXTRA_ALBUM_ID)
     } else {
       honoredArgs.add(CloudMediaProviderContract.EXTRA_SYNC_GENERATION)
+    }
+    if (mimeTypes.isNotEmpty()) honoredArgs.add(Intent.EXTRA_MIME_TYPES)
+    if (
+      extras.containsKey(CloudMediaProviderContract.EXTRA_SORT_ORDER) &&
+      extras.getInt(CloudMediaProviderContract.EXTRA_SORT_ORDER) ==
+      CloudMediaProviderContract.SORT_ORDER_DESC_DATE_TAKEN
+    ) {
+      honoredArgs.add(CloudMediaProviderContract.EXTRA_SORT_ORDER)
     }
     cursorExtras.putStringArrayList(ContentResolver.EXTRA_HONORED_ARGS, honoredArgs)
     cursor.extras = cursorExtras
@@ -199,13 +218,25 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   ): Cursor {
     val pageSize = extras.getInt(CloudMediaProviderContract.EXTRA_PAGE_SIZE, 500)
     val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
-    val result = ImmichRepository.queryPersonAssets(personId = mediaSetId, pageSize = pageSize, pageToken = pageToken)
+    val mimeTypes = requestedMimeTypes(extras)
+    val result = ImmichRepository.queryPersonAssets(
+      personId = mediaSetId,
+      pageSize = pageSize,
+      pageToken = pageToken
+    ).filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
     val cursorExtras = Bundle()
     cursorExtras.putString(CloudMediaProviderContract.EXTRA_MEDIA_COLLECTION_ID, ImmichRepository.getMediaCollectionId())
     if (result.nextPageToken != null) {
       cursorExtras.putString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN, result.nextPageToken)
     }
+    cursorExtras.putStringArrayList(
+      ContentResolver.EXTRA_HONORED_ARGS,
+      arrayListOf(
+        CloudMediaProviderContract.EXTRA_PAGE_SIZE,
+        CloudMediaProviderContract.EXTRA_PAGE_TOKEN
+      ).apply { if (mimeTypes.isNotEmpty()) add(Intent.EXTRA_MIME_TYPES) }
+    )
     cursor.extras = cursorExtras
     return cursor
   }
@@ -235,13 +266,25 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   ): Cursor {
     val pageSize = extras.getInt(CloudMediaProviderContract.EXTRA_PAGE_SIZE, 500)
     val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
-    val result = ImmichRepository.queryPersonAssets(personId = suggestedMediaSetId, pageSize = pageSize, pageToken = pageToken)
+    val mimeTypes = requestedMimeTypes(extras)
+    val result = ImmichRepository.queryPersonAssets(
+      personId = suggestedMediaSetId,
+      pageSize = pageSize,
+      pageToken = pageToken
+    ).filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
     val cursorExtras = Bundle()
     cursorExtras.putString(CloudMediaProviderContract.EXTRA_MEDIA_COLLECTION_ID, ImmichRepository.getMediaCollectionId())
     if (result.nextPageToken != null) {
       cursorExtras.putString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN, result.nextPageToken)
     }
+    cursorExtras.putStringArrayList(
+      ContentResolver.EXTRA_HONORED_ARGS,
+      arrayListOf(
+        CloudMediaProviderContract.EXTRA_PAGE_SIZE,
+        CloudMediaProviderContract.EXTRA_PAGE_TOKEN
+      ).apply { if (mimeTypes.isNotEmpty()) add(Intent.EXTRA_MIME_TYPES) }
+    )
     cursor.extras = cursorExtras
     return cursor
   }
@@ -252,9 +295,27 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     extras: Bundle,
     cancellationSignal: CancellationSignal?
   ): Cursor {
-    val result = ImmichRepository.searchAssets(query = searchText, pageSize = 25)
+    val pageSize = extras.getInt(CloudMediaProviderContract.EXTRA_PAGE_SIZE, 100)
+    val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
+    val mimeTypes = requestedMimeTypes(extras)
+    val result = ImmichRepository.searchAssets(
+      query = searchText,
+      pageSize = pageSize,
+      pageToken = pageToken
+    ).filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
-    cursor.extras = buildCollectionIdExtras()
+    val cursorExtras = buildCollectionIdExtras()
+    if (result.nextPageToken != null) {
+      cursorExtras.putString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN, result.nextPageToken)
+    }
+    cursorExtras.putStringArrayList(
+      ContentResolver.EXTRA_HONORED_ARGS,
+      arrayListOf(
+        CloudMediaProviderContract.EXTRA_PAGE_SIZE,
+        CloudMediaProviderContract.EXTRA_PAGE_TOKEN
+      ).apply { if (mimeTypes.isNotEmpty()) add(Intent.EXTRA_MIME_TYPES) }
+    )
+    cursor.extras = cursorExtras
     return cursor
   }
 
@@ -279,7 +340,15 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
   ): AssetFileDescriptor {
     checkPermission()
     Log.d(TAG, "onOpenPreview: mediaId=$mediaId size=${size.x}x${size.y}")
-    val fd = ImmichRepository.openPreview(mediaId, size, cancellationSignal)
+    val thumbnailRequested = extras?.getBoolean(
+      CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL,
+      false
+    ) == true
+    val fd = if (ImmichRepository.isVideo(mediaId) && !thumbnailRequested) {
+      ImmichRepository.openVideoPlayback(mediaId, cancellationSignal)
+    } else {
+      ImmichRepository.openPreview(mediaId, size, cancellationSignal)
+    }
       ?: throw FileNotFoundException("Failed to open preview: $mediaId")
     return AssetFileDescriptor(fd, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
   }
@@ -315,6 +384,22 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     }
     return cursor
   }
+
+  private fun QueryResult.filterMimeTypes(mimeTypes: List<String>): QueryResult {
+    if (mimeTypes.isEmpty() || mimeTypes.any { it == "*/*" }) return this
+    return copy(assets = assets.filter { asset ->
+      mimeTypes.any { requested ->
+        if (requested.endsWith("/*")) {
+          asset.mimeType.startsWith(requested.removeSuffix("*"))
+        } else {
+          asset.mimeType == requested
+        }
+      }
+    })
+  }
+
+  private fun requestedMimeTypes(extras: Bundle): List<String> =
+    extras.getStringArray(Intent.EXTRA_MIME_TYPES)?.filter { it.isNotBlank() }.orEmpty()
 
   private fun buildCollectionIdExtras(): Bundle {
     val extras = Bundle()

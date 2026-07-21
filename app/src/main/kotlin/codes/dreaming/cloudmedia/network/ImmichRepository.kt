@@ -7,6 +7,7 @@ import android.graphics.Point
 import android.net.Uri
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.os.storage.StorageManager
 import android.provider.MediaStore
 import android.util.Log
 import okhttp3.MediaType.Companion.toMediaType
@@ -16,6 +17,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.net.URLConnection
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -173,11 +175,12 @@ object ImmichRepository {
   fun queryAllAssets(
     syncGeneration: Long? = null,
     pageSize: Int = 1000,
-    pageToken: String? = null
+    pageToken: String? = null,
+    mimeTypes: List<String> = emptyList()
   ): QueryResult {
     Log.d(TAG, "queryAllAssets: pageSize=$pageSize, pageToken=$pageToken")
     ensureInitialSnapshot()
-    return snapshotDatabase.queryAssets(syncGeneration ?: 0, pageSize, pageToken)
+    return snapshotDatabase.queryAssets(syncGeneration ?: 0, pageSize, pageToken, mimeTypes)
   }
 
   @Synchronized
@@ -340,46 +343,31 @@ object ImmichRepository {
       return downloadToTempFile(Request.Builder().url(url).get().build(), "person_$personId", cancellationSignal)
     }
     val url = ApiClient.buildUrl("/assets/$assetId/original") ?: return null
-    return downloadToTempFile(Request.Builder().url(url).get().build(), "media_$assetId", cancellationSignal)
+    val knownSize = snapshotDatabase.getAsset(assetId)?.sizeBytes?.takeIf { it > 1 }
+    return openRemoteFile(url, knownSize, cancellationSignal)
   }
 
-  fun openMediaStreaming(assetId: String): ParcelFileDescriptor? {
-    Log.d(TAG, "openMediaStreaming: assetId=$assetId")
-    if (assetId.startsWith("person:")) {
-      val personId = assetId.removePrefix("person:")
-      val url = ApiClient.buildUrl("/people/$personId/thumbnail") ?: return null
-      return downloadToTempFile(Request.Builder().url(url).get().build(), "person_$personId")
-    }
-    val url = ApiClient.buildUrl("/assets/$assetId/original") ?: return null
-    val request = Request.Builder().url(url).get().build()
+  fun openVideoPlayback(
+    assetId: String,
+    cancellationSignal: CancellationSignal? = null
+  ): ParcelFileDescriptor? {
+    val url = ApiClient.buildUrl("/assets/$assetId/video/playback") ?: return null
+    return openRemoteFile(url, null, cancellationSignal)
+  }
+
+  fun isVideo(assetId: String): Boolean = snapshotDatabase.getAsset(assetId)?.isImage == false
+
+  private fun openRemoteFile(
+    url: okhttp3.HttpUrl,
+    knownSize: Long?,
+    cancellationSignal: CancellationSignal?
+  ): ParcelFileDescriptor? {
     return try {
-      val pipe = ParcelFileDescriptor.createPipe()
-      val readFd = pipe[0]
-      val writeFd = pipe[1]
-      Thread {
-        try {
-          val response = ApiClient.getClient().newCall(request).execute()
-          if (!response.isSuccessful) {
-            Log.e(TAG, "openMediaStreaming: HTTP ${response.code} for $assetId")
-            response.close()
-            writeFd.close()
-            return@Thread
-          }
-          ParcelFileDescriptor.AutoCloseOutputStream(writeFd).use { output ->
-            response.body?.byteStream()?.use { input ->
-              input.copyTo(output, 65536)
-            }
-          }
-          response.close()
-          Log.d(TAG, "openMediaStreaming: completed streaming $assetId")
-        } catch (e: Exception) {
-          Log.e(TAG, "openMediaStreaming: error streaming $assetId", e)
-          try { writeFd.close() } catch (_: Exception) {}
-        }
-      }.start()
-      readFd
+      cancellationSignal?.throwIfCanceled()
+      val storageManager = appContext.getSystemService(StorageManager::class.java)
+      RemoteFileProxy(storageManager, url, knownSize, cancellationSignal).open()
     } catch (e: Exception) {
-      Log.e(TAG, "openMediaStreaming: pipe creation failed for $assetId", e)
+      Log.e(TAG, "Failed to open seekable remote media: $url", e)
       null
     }
   }
@@ -399,7 +387,7 @@ object ImmichRepository {
     val urlWithParams = url.newBuilder().addQueryParameter("size", sizeParam).build()
     return downloadToTempFile(
       Request.Builder().url(urlWithParams).get().build(),
-      "preview_${assetId}_$sizeParam",
+      "preview_${assetId}_${snapshotDatabase.getAsset(assetId)?.syncGeneration ?: 0}_$sizeParam",
       cancellationSignal
     )
   }
@@ -409,7 +397,14 @@ object ImmichRepository {
     prefix: String,
     cancellationSignal: CancellationSignal? = null
   ): ParcelFileDescriptor? {
+    val cacheDir = File(appContext.cacheDir, "immich_previews").apply { mkdirs() }
+    val safeName = prefix.replace(Regex("[^A-Za-z0-9._-]"), "_")
+    val cacheFile = File(cacheDir, safeName)
+    if (cacheFile.isFile && cacheFile.length() > 0) {
+      return ParcelFileDescriptor.open(cacheFile, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
     val call = ApiClient.getClient().newCall(request)
+    var pendingFile: File? = null
     return try {
       cancellationSignal?.throwIfCanceled()
       cancellationSignal?.setOnCancelListener { call.cancel() }
@@ -419,17 +414,36 @@ object ImmichRepository {
         response.close()
         return null
       }
-      val tempFile = File.createTempFile(prefix, null, appContext.cacheDir)
+      val tempFile = File.createTempFile("pending_", ".media", cacheDir)
+      pendingFile = tempFile
       response.body?.byteStream()?.use { input ->
         tempFile.outputStream().use { output -> input.copyTo(output, 65536) }
       }
       response.close()
-      ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+      if (tempFile.length() <= 0) throw IOException("Downloaded an empty preview")
+      if (!tempFile.renameTo(cacheFile)) {
+        if (!cacheFile.exists()) throw IOException("Unable to store preview cache entry")
+        tempFile.delete()
+      }
+      pendingFile = null
+      trimPreviewCache(cacheDir)
+      ParcelFileDescriptor.open(cacheFile, ParcelFileDescriptor.MODE_READ_ONLY)
     } catch (e: Exception) {
       Log.e(TAG, "downloadToTempFile error", e)
       null
     } finally {
+      pendingFile?.delete()
       cancellationSignal?.setOnCancelListener(null)
+    }
+  }
+
+  private fun trimPreviewCache(cacheDir: File) {
+    val files = cacheDir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }
+      ?: return
+    var retainedBytes = 0L
+    for (file in files) {
+      retainedBytes += file.length()
+      if (retainedBytes > MAX_PREVIEW_CACHE_BYTES) file.delete()
     }
   }
 
@@ -444,17 +458,19 @@ object ImmichRepository {
     }
     val exifInfo = a.optJSONObject("exifInfo")
     val fileSize = a.optLong("fileSizeInByte", exifInfo?.optLong("fileSizeInByte", 1) ?: 1L)
-    val orientation = exifInfo?.optString("orientation", "0")?.toIntOrNull() ?: 0
+    val orientation = parseOrientation(exifInfo?.optString("orientation", "0"))
     val width = a.optInt("width", exifInfo?.optInt("exifImageWidth", 0) ?: 0)
     val height = a.optInt("height", exifInfo?.optInt("exifImageHeight", 0) ?: 0)
     val durationMillis = when (val duration = a.opt("duration")) {
-      is Number -> duration.toLong() * 1000L
+      is Number -> duration.toLong()
       is String -> parseDuration(duration)
       else -> 0L
     }
 
     val mimeType = when {
       originalMimeType.isNotBlank() && originalMimeType != "null" -> originalMimeType
+      originalFileName != null -> URLConnection.guessContentTypeFromName(originalFileName)
+        ?: if (isImage) "image/jpeg" else "video/mp4"
       isImage -> "image/jpeg"
       else -> "video/mp4"
     }
@@ -645,6 +661,16 @@ object ImmichRepository {
     } catch (_: Exception) { 0 }
   }
 
+  private fun parseOrientation(value: String?): Int {
+    return when (value?.trim()?.toIntOrNull()) {
+      1, 0, null -> 0
+      3, 180 -> 180
+      6, 90 -> 90
+      8, 270 -> 270
+      else -> 0
+    }
+  }
+
   private fun parseIso8601(dateStr: String): Long {
     return try {
       java.time.Instant.parse(dateStr).toEpochMilli()
@@ -657,4 +683,6 @@ object ImmichRepository {
       }
     }
   }
+
+  private const val MAX_PREVIEW_CACHE_BYTES = 256L * 1024 * 1024
 }

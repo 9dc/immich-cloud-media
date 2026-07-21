@@ -18,6 +18,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.URLConnection
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -67,7 +68,9 @@ object ImmichRepository {
   private var initialized = false
   private val refreshInProgress = AtomicBoolean(false)
 
+  @Volatile
   private var cachedPeople: List<ImmichPerson>? = null
+  private val peopleRefreshInProgress = AtomicBoolean(false)
   private var peopleCacheTime: Long = 0
   private const val PEOPLE_CACHE_TTL_MS = 5 * 60 * 1000L
 
@@ -254,10 +257,26 @@ object ImmichRepository {
     }
   }
 
+  fun getCachedPeople(): List<ImmichPerson> = cachedPeople.orEmpty()
+
+  fun requestPeopleRefresh() {
+    val now = System.currentTimeMillis()
+    if (!isConfigured || cachedPeople != null && now - peopleCacheTime < PEOPLE_CACHE_TTL_MS) return
+    if (!peopleRefreshInProgress.compareAndSet(false, true)) return
+    Thread({
+      try {
+        queryPeople()
+      } finally {
+        peopleRefreshInProgress.set(false)
+      }
+    }, "immich-people-refresh").start()
+  }
+
   fun queryPersonAssets(
     personId: String,
     pageSize: Int = 1000,
-    pageToken: String? = null
+    pageToken: String? = null,
+    cancellationSignal: CancellationSignal? = null
   ): QueryResult {
     return try {
       val page = pageToken?.toIntOrNull() ?: 1
@@ -273,22 +292,25 @@ object ImmichRepository {
         .url(url)
         .post(body.toString().toRequestBody("application/json".toMediaType()))
         .build()
-      val response = ApiClient.getClient().newCall(request).execute()
-      if (!response.isSuccessful) {
-        response.close()
-        return QueryResult(emptyList(), null)
+      val call = ApiClient.getClient().newCall(request)
+      cancellationSignal?.setOnCancelListener { call.cancel() }
+      try {
+        cancellationSignal?.throwIfCanceled()
+        call.execute().use { response ->
+          val responseBody = response.body?.string() ?: "{}"
+          if (!response.isSuccessful) {
+            throw IOException("Immich person search failed with HTTP ${response.code}: ${responseBody.take(200)}")
+          }
+          val assetsObj = JSONObject(responseBody).optJSONObject("assets")
+            ?: throw IOException("Immich person search response did not contain assets")
+          val items = assetsObj.optJSONArray("items") ?: JSONArray()
+          val assets = mutableListOf<ImmichAsset>()
+          for (i in 0 until items.length()) assets.add(assetFromApiJson(items.getJSONObject(i)))
+          QueryResult(assets, parseNextPage(assetsObj))
+        }
+      } finally {
+        cancellationSignal?.setOnCancelListener(null)
       }
-      val responseBody = response.body?.string() ?: "{}"
-      response.close()
-      val result = JSONObject(responseBody)
-      val assetsObj = result.optJSONObject("assets") ?: return QueryResult(emptyList(), null)
-      val items = assetsObj.optJSONArray("items") ?: return QueryResult(emptyList(), null)
-      val assets = mutableListOf<ImmichAsset>()
-      for (i in 0 until items.length()) {
-        assets.add(assetFromApiJson(items.getJSONObject(i)))
-      }
-      val nextToken = parseNextPage(assetsObj)
-      QueryResult(assets, nextToken)
     } catch (e: Exception) {
       Log.e(TAG, "queryPersonAssets error", e)
       QueryResult(emptyList(), null)
@@ -298,7 +320,8 @@ object ImmichRepository {
   fun searchAssets(
     query: String,
     pageSize: Int = 100,
-    pageToken: String? = null
+    pageToken: String? = null,
+    cancellationSignal: CancellationSignal? = null
   ): QueryResult {
     return try {
       val page = pageToken?.toIntOrNull() ?: 1
@@ -309,27 +332,32 @@ object ImmichRepository {
         put("page", page)
         put("size", requestSize)
         put("withExif", true)
+        put("visibility", "timeline")
+        put("language", Locale.getDefault().toLanguageTag())
       }
       val request = Request.Builder()
         .url(url)
         .post(body.toString().toRequestBody("application/json".toMediaType()))
         .build()
-      val response = ApiClient.getClient().newCall(request).execute()
-      if (!response.isSuccessful) {
-        response.close()
-        return QueryResult(emptyList(), null)
+      val call = ApiClient.getClient().newCall(request)
+      cancellationSignal?.setOnCancelListener { call.cancel() }
+      try {
+        cancellationSignal?.throwIfCanceled()
+        call.execute().use { response ->
+          val responseBody = response.body?.string() ?: "{}"
+          if (!response.isSuccessful) {
+            throw IOException("Immich smart search failed with HTTP ${response.code}: ${responseBody.take(200)}")
+          }
+          val assetsObj = JSONObject(responseBody).optJSONObject("assets")
+            ?: throw IOException("Immich smart search response did not contain assets")
+          val items = assetsObj.optJSONArray("items") ?: JSONArray()
+          val assets = mutableListOf<ImmichAsset>()
+          for (i in 0 until items.length()) assets.add(assetFromApiJson(items.getJSONObject(i)))
+          QueryResult(assets, parseNextPage(assetsObj))
+        }
+      } finally {
+        cancellationSignal?.setOnCancelListener(null)
       }
-      val responseBody = response.body?.string() ?: "{}"
-      response.close()
-      val result = JSONObject(responseBody)
-      val assetsObj = result.optJSONObject("assets") ?: return QueryResult(emptyList(), null)
-      val items = assetsObj.optJSONArray("items") ?: return QueryResult(emptyList(), null)
-      val assets = mutableListOf<ImmichAsset>()
-      for (i in 0 until items.length()) {
-        assets.add(assetFromApiJson(items.getJSONObject(i)))
-      }
-      val nextToken = parseNextPage(assetsObj)
-      QueryResult(assets, nextToken)
     } catch (e: Exception) {
       Log.e(TAG, "searchAssets error", e)
       QueryResult(emptyList(), null)

@@ -22,8 +22,6 @@ private const val TAG = "ImmichCloudMedia"
 private const val CATEGORY_PEOPLE = "immich_people"
 private const val CATEGORY_TYPE_PEOPLE_AND_PETS =
   "com.android.providers.media.MEDIA_CATEGORY_TYPE_PEOPLE_AND_PETS"
-private const val SUGGESTION_TYPE_FACE =
-  "com.android.providers.media.SEARCH_SUGGESTION_FACE"
 
 class ImmichCloudMediaProvider : CloudMediaProvider() {
 
@@ -31,6 +29,7 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     val ctx = context ?: return false
     ImmichRepository.initialize(ctx)
     ImmichRepository.requestRefresh(::notifyMediaChanged)
+    ImmichRepository.requestPeopleRefresh()
     return true
   }
 
@@ -248,10 +247,32 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     cancellationSignal: CancellationSignal?
   ): Cursor {
     val cursor = MatrixCursor(SEARCH_SUGGESTION_PROJECTION)
-    val people = ImmichRepository.queryPeople()
+    val query = prefixText.trim()
+    if (query.isNotEmpty()) {
+      cursor.addRow(
+        arrayOf(
+          SearchSuggestionIds.forText(query),
+          query,
+          CloudMediaProviderContract.SEARCH_SUGGESTION_TEXT,
+          null
+        )
+      )
+    }
+
+    // Android gives suggestion providers only 300 ms. Refresh asynchronously
+    // and use the last known people list rather than doing network I/O here.
+    ImmichRepository.requestPeopleRefresh()
+    val people = ImmichRepository.getCachedPeople()
     for (person in people) {
-      if (prefixText.isNotEmpty() && !person.name.contains(prefixText, ignoreCase = true)) continue
-      cursor.addRow(arrayOf(person.id, person.name, SUGGESTION_TYPE_FACE, person.coverAssetId))
+      if (query.isNotEmpty() && !person.name.contains(query, ignoreCase = true)) continue
+      cursor.addRow(
+        arrayOf(
+          SearchSuggestionIds.forPerson(person.id),
+          person.name,
+          CloudMediaProviderContract.SEARCH_SUGGESTION_FACE,
+          person.coverAssetId
+        )
+      )
     }
     cursor.extras = buildCollectionIdExtras()
     return cursor
@@ -267,11 +288,21 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     val pageSize = extras.getInt(CloudMediaProviderContract.EXTRA_PAGE_SIZE, 500)
     val pageToken = extras.getString(CloudMediaProviderContract.EXTRA_PAGE_TOKEN)
     val mimeTypes = requestedMimeTypes(extras)
-    val result = ImmichRepository.queryPersonAssets(
-      personId = suggestedMediaSetId,
-      pageSize = pageSize,
-      pageToken = pageToken
-    ).filterMimeTypes(mimeTypes)
+    val result = when (val target = SearchSuggestionIds.resolve(suggestedMediaSetId, fallbackSearchText)) {
+      is SearchTarget.Person -> ImmichRepository.queryPersonAssets(
+        personId = target.personId,
+        pageSize = pageSize,
+        pageToken = pageToken,
+        cancellationSignal = cancellationSignal
+      )
+
+      is SearchTarget.Text -> ImmichRepository.searchAssets(
+        query = target.query,
+        pageSize = pageSize,
+        pageToken = pageToken,
+        cancellationSignal = cancellationSignal
+      )
+    }.filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
     val cursorExtras = Bundle()
     cursorExtras.putString(CloudMediaProviderContract.EXTRA_MEDIA_COLLECTION_ID, ImmichRepository.getMediaCollectionId())
@@ -301,7 +332,8 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     val result = ImmichRepository.searchAssets(
       query = searchText,
       pageSize = pageSize,
-      pageToken = pageToken
+      pageToken = pageToken,
+      cancellationSignal = cancellationSignal
     ).filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
     val cursorExtras = buildCollectionIdExtras()

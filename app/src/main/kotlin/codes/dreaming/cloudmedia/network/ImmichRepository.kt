@@ -84,9 +84,10 @@ object ImmichRepository {
 
   private const val CURRENT_COLLECTION_VERSION = "immich-cloud-v8"
   private const val API_PAGE_SIZE = 1000
-  // Android's Photo Picker aborts each search page after three seconds. It asks
-  // for 500 rows, but a compact first page lets it display results immediately
-  // and continue syncing the remaining pages in the background.
+  // Android's Photo Picker aborts each search page after three seconds and
+  // re-sorts cached cloud results by capture date instead of preserving the
+  // provider's relevance order. Keep only Immich's strongest result page so
+  // weak later matches cannot rise above good matches merely by being newer.
   private const val SMART_SEARCH_PAGE_SIZE = 50
 
   fun initialize(context: Context) {
@@ -365,7 +366,10 @@ object ImmichRepository {
             "Smart search page $page returned ${assets.size} assets in " +
               "${System.currentTimeMillis() - startedAt} ms"
           )
-          QueryResult(assets, parseNextPage(assetsObj))
+          // Do not expose Immich's later relevance pages. Android discards the
+          // relevance position and merges every page using date-descending
+          // order, which otherwise puts recent low-confidence matches first.
+          QueryResult(assets, null)
         }
       } finally {
         cancellationSignal?.setOnCancelListener(null)

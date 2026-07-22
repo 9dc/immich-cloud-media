@@ -20,7 +20,14 @@ import java.io.IOException
 import java.net.URLConnection
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "ImmichRepo"
 private const val SYNC_PREFS = "immich_cloud_sync"
@@ -84,11 +91,28 @@ object ImmichRepository {
 
   private const val CURRENT_COLLECTION_VERSION = "immich-cloud-v8"
   private const val API_PAGE_SIZE = 1000
-  // Android's Photo Picker aborts each search page after three seconds and
-  // re-sorts cached cloud results by capture date instead of preserving the
-  // provider's relevance order. Keep only Immich's strongest result page so
-  // weak later matches cannot rise above good matches merely by being newer.
-  private const val SMART_SEARCH_PAGE_SIZE = 50
+  // This is Immich Web's default smart-search page size. Returning exactly the
+  // first page keeps the hit set aligned with Web while avoiding weak pages
+  // that Android would merge and re-sort by capture date.
+  private const val SMART_SEARCH_PAGE_SIZE = 100
+  private const val SMART_SEARCH_CACHE_TTL_MS = 10 * 60 * 1000L
+  private const val SMART_SEARCH_CACHE_ENTRIES = 24
+  private const val SMART_SEARCH_PREFETCH_DELAY_MS = 120L
+
+  private val smartSearchCache = ExpiringLruCache<String, QueryResult>(
+    maxEntries = SMART_SEARCH_CACHE_ENTRIES,
+    ttlMillis = SMART_SEARCH_CACHE_TTL_MS
+  )
+  private val smartSearchStateLock = Any()
+  private val smartSearchGeneration = AtomicLong(0)
+  private val smartSearchInFlight = mutableMapOf<String, CompletableFuture<QueryResult>>()
+  private val smartSearchExecutor = Executors.newFixedThreadPool(2) { runnable ->
+    Thread(runnable, "immich-smart-search").apply { isDaemon = true }
+  }
+  private val smartSearchPrefetchExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+    Thread(runnable, "immich-search-prefetch").apply { isDaemon = true }
+  }
+  private var pendingSmartSearchPrefetch: ScheduledFuture<*>? = null
 
   fun initialize(context: Context) {
     if (initialized) return
@@ -168,6 +192,13 @@ object ImmichRepository {
     syncGeneration = 0
     cachedPeople = null
     localMediaLookup = null
+    smartSearchCache.clear()
+    smartSearchGeneration.incrementAndGet()
+    synchronized(smartSearchStateLock) {
+      pendingSmartSearchPrefetch?.cancel(false)
+      pendingSmartSearchPrefetch = null
+      smartSearchInFlight.clear()
+    }
     syncPrefs.edit()
       .putLong("sync_generation", 0)
       .putBoolean("snapshot_initialized", false)
@@ -277,6 +308,29 @@ object ImmichRepository {
     }, "immich-people-refresh").start()
   }
 
+  /**
+   * Starts Immich's text embedding while the user is still looking at search
+   * suggestions. Android only waits three seconds after a search is submitted,
+   * which is sometimes shorter than an uncached ML request on a remote server.
+   */
+  fun requestSearchPrefetch(query: String, mimeTypes: List<String> = emptyList()) {
+    val normalizedQuery = query.trim()
+    if (!isConfigured || normalizedQuery.length < 3) return
+    val language = currentSearchLanguage()
+    val assetType = immichAssetTypeForMimeTypes(mimeTypes)
+    val key = smartSearchKey(normalizedQuery, language, assetType)
+
+    synchronized(smartSearchStateLock) {
+      pendingSmartSearchPrefetch?.cancel(false)
+      if (smartSearchCache.get(key) != null || smartSearchInFlight.containsKey(key)) return
+      pendingSmartSearchPrefetch = smartSearchPrefetchExecutor.schedule(
+        { getOrStartSmartSearch(key, normalizedQuery, language, assetType) },
+        SMART_SEARCH_PREFETCH_DELAY_MS,
+        TimeUnit.MILLISECONDS
+      )
+    }
+  }
+
   fun queryPersonAssets(
     personId: String,
     pageSize: Int = 1000,
@@ -326,59 +380,129 @@ object ImmichRepository {
     query: String,
     pageSize: Int = 100,
     pageToken: String? = null,
-    cancellationSignal: CancellationSignal? = null
+    cancellationSignal: CancellationSignal? = null,
+    mimeTypes: List<String> = emptyList()
   ): QueryResult {
     return try {
-      val startedAt = System.currentTimeMillis()
-      val page = pageToken?.toIntOrNull() ?: 1
+      // The current search implementation deliberately exposes one relevance
+      // page. Ignore resume tokens left by older app versions.
+      if (!pageToken.isNullOrBlank()) return QueryResult(emptyList(), null)
       val requestSize = pageSize.coerceIn(1, SMART_SEARCH_PAGE_SIZE)
-      val url = ApiClient.buildUrl("/search/smart") ?: return QueryResult(emptyList(), null)
-      val body = JSONObject().apply {
-        put("query", query)
-        put("page", page)
-        put("size", requestSize)
-        // Search synchronization only consumes the asset ID and optional local
-        // URI. Full EXIF is already present in the Picker's synced media table.
-        put("withExif", false)
-        put("visibility", "timeline")
-        put("language", Locale.getDefault().toLanguageTag())
-      }
-      val request = Request.Builder()
-        .url(url)
-        .post(body.toString().toRequestBody("application/json".toMediaType()))
-        .build()
-      val call = ApiClient.getClient().newCall(request)
-      cancellationSignal?.setOnCancelListener { call.cancel() }
-      try {
+      val normalizedQuery = query.trim()
+      if (normalizedQuery.isEmpty()) return QueryResult(emptyList(), null)
+      val language = currentSearchLanguage()
+      val assetType = immichAssetTypeForMimeTypes(mimeTypes)
+      val key = smartSearchKey(normalizedQuery, language, assetType)
+      val fullResult = smartSearchCache.get(key) ?: run {
         cancellationSignal?.throwIfCanceled()
-        call.execute().use { response ->
-          val responseBody = response.body?.string() ?: "{}"
-          if (!response.isSuccessful) {
-            throw IOException("Immich smart search failed with HTTP ${response.code}: ${responseBody.take(200)}")
-          }
-          val assetsObj = JSONObject(responseBody).optJSONObject("assets")
-            ?: throw IOException("Immich smart search response did not contain assets")
-          val items = assetsObj.optJSONArray("items") ?: JSONArray()
-          val assets = mutableListOf<ImmichAsset>()
-          for (i in 0 until items.length()) assets.add(assetFromApiJson(items.getJSONObject(i)))
-          Log.d(
-            TAG,
-            "Smart search page $page returned ${assets.size} assets in " +
-              "${System.currentTimeMillis() - startedAt} ms"
-          )
-          // Do not expose Immich's later relevance pages. Android discards the
-          // relevance position and merges every page using date-descending
-          // order, which otherwise puts recent low-confidence matches first.
-          QueryResult(assets, null)
-        }
-      } finally {
-        cancellationSignal?.setOnCancelListener(null)
+        awaitSmartSearch(
+          getOrStartSmartSearch(key, normalizedQuery, language, assetType),
+          cancellationSignal
+        )
       }
+      fullResult.copy(assets = fullResult.assets.take(requestSize), nextPageToken = null)
     } catch (e: Exception) {
       Log.e(TAG, "searchAssets error", e)
       QueryResult(emptyList(), null)
     }
   }
+
+  private fun getOrStartSmartSearch(
+    key: String,
+    query: String,
+    language: String,
+    assetType: String?
+  ): CompletableFuture<QueryResult> {
+    smartSearchCache.get(key)?.let { return CompletableFuture.completedFuture(it) }
+
+    synchronized(smartSearchStateLock) {
+      smartSearchCache.get(key)?.let { return CompletableFuture.completedFuture(it) }
+      smartSearchInFlight[key]?.let { return it }
+
+      val future = CompletableFuture<QueryResult>()
+      val generation = smartSearchGeneration.get()
+      smartSearchInFlight[key] = future
+      smartSearchExecutor.execute {
+        try {
+          val result = fetchSmartSearch(query, language, assetType)
+          if (smartSearchGeneration.get() == generation) {
+            smartSearchCache.put(key, result)
+            future.complete(result)
+          } else {
+            future.completeExceptionally(IOException("Immich account changed during search"))
+          }
+        } catch (e: Exception) {
+          future.completeExceptionally(e)
+        } finally {
+          synchronized(smartSearchStateLock) {
+            if (smartSearchInFlight[key] === future) smartSearchInFlight.remove(key)
+          }
+        }
+      }
+      return future
+    }
+  }
+
+  private fun awaitSmartSearch(
+    future: CompletableFuture<QueryResult>,
+    cancellationSignal: CancellationSignal?
+  ): QueryResult {
+    while (true) {
+      cancellationSignal?.throwIfCanceled()
+      try {
+        return future.get(100, TimeUnit.MILLISECONDS)
+      } catch (_: TimeoutException) {
+        // Poll so an abandoned picker request stops waiting promptly. The
+        // shared prefetch remains useful for a subsequent attempt.
+      } catch (e: ExecutionException) {
+        throw (e.cause as? Exception ?: e)
+      }
+    }
+  }
+
+  private fun fetchSmartSearch(query: String, language: String, assetType: String?): QueryResult {
+    val startedAt = System.currentTimeMillis()
+    val url = ApiClient.buildUrl("/search/smart")
+      ?: throw IOException("Immich server is not configured")
+    val body = JSONObject().apply {
+      put("query", query)
+      put("page", 1)
+      put("size", SMART_SEARCH_PAGE_SIZE)
+      // Search synchronization consumes only the ID and optional local URI.
+      // Full EXIF is already present in Android's synced media table.
+      put("withExif", false)
+      put("visibility", "timeline")
+      put("language", language)
+      if (assetType != null) put("type", assetType)
+    }
+    val request = Request.Builder()
+      .url(url)
+      .post(body.toString().toRequestBody("application/json".toMediaType()))
+      .build()
+
+    ApiClient.getClient().newCall(request).execute().use { response ->
+      val responseBody = response.body?.string() ?: "{}"
+      if (!response.isSuccessful) {
+        throw IOException("Immich smart search failed with HTTP ${response.code}: ${responseBody.take(200)}")
+      }
+      val assetsObj = JSONObject(responseBody).optJSONObject("assets")
+        ?: throw IOException("Immich smart search response did not contain assets")
+      val items = assetsObj.optJSONArray("items") ?: JSONArray()
+      val assets = ArrayList<ImmichAsset>(items.length())
+      for (i in 0 until items.length()) assets += assetFromApiJson(items.getJSONObject(i))
+      Log.d(
+        TAG,
+        "Smart search returned ${assets.size} assets in " +
+          "${System.currentTimeMillis() - startedAt} ms"
+      )
+      return QueryResult(assets, null)
+    }
+  }
+
+  private fun currentSearchLanguage(): String = Locale.getDefault().toLanguageTag()
+
+  private fun smartSearchKey(query: String, language: String, assetType: String?): String =
+    "$language\u0000${assetType.orEmpty()}\u0000${query.trim()}"
 
   fun openMedia(assetId: String, cancellationSignal: CancellationSignal? = null): ParcelFileDescriptor? {
     if (assetId.startsWith("person:")) {

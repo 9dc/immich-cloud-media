@@ -39,6 +39,14 @@ adb shell device_config override mediaprovider allowed_cloud_providers codes.dre
 - Video playback with streaming support
 - Thumbnail previews and full-resolution downloads on demand
 
+### Search behavior
+
+The provider requests the same first 100 smart-search matches as Immich Web and
+starts the request while search suggestions are visible to stay within Android's
+three-second cloud-search window. In the picker, tap the `Immich: …` suggestion
+to run a provider-scoped search. Android currently displays cloud search matches
+by capture date rather than preserving Immich's relevance order.
+
 ## Building from source
 
 ```sh

@@ -8,7 +8,7 @@ internal sealed interface SearchTarget {
 internal object SearchSuggestionIds {
   // Version this ID when search behavior changes. Android persists completed
   // searches by media-set ID, including an empty result caused by a timeout.
-  private const val TEXT_PREFIX = "immich:v3:text:"
+  private const val TEXT_PREFIX = "immich:v4:text:"
   private const val PERSON_PREFIX = "immich:person:"
 
   fun forText(query: String): String = TEXT_PREFIX + query.trim()

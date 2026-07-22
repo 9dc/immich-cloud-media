@@ -249,10 +249,11 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
     val cursor = MatrixCursor(SEARCH_SUGGESTION_PROJECTION)
     val query = prefixText.trim()
     if (query.isNotEmpty()) {
+      ImmichRepository.requestSearchPrefetch(query, requestedMimeTypes(extras))
       cursor.addRow(
         arrayOf(
           SearchSuggestionIds.forText(query),
-          query,
+          "Immich: $query",
           CloudMediaProviderContract.SEARCH_SUGGESTION_TEXT,
           null
         )
@@ -300,7 +301,8 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
         query = target.query,
         pageSize = pageSize,
         pageToken = pageToken,
-        cancellationSignal = cancellationSignal
+        cancellationSignal = cancellationSignal,
+        mimeTypes = mimeTypes
       )
     }.filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
@@ -333,7 +335,8 @@ class ImmichCloudMediaProvider : CloudMediaProvider() {
       query = searchText,
       pageSize = pageSize,
       pageToken = pageToken,
-      cancellationSignal = cancellationSignal
+      cancellationSignal = cancellationSignal,
+      mimeTypes = mimeTypes
     ).filterMimeTypes(mimeTypes)
     val cursor = buildMediaCursor(result)
     val cursorExtras = buildCollectionIdExtras()

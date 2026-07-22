@@ -84,6 +84,10 @@ object ImmichRepository {
 
   private const val CURRENT_COLLECTION_VERSION = "immich-cloud-v8"
   private const val API_PAGE_SIZE = 1000
+  // Android's Photo Picker aborts each search page after three seconds. It asks
+  // for 500 rows, but a compact first page lets it display results immediately
+  // and continue syncing the remaining pages in the background.
+  private const val SMART_SEARCH_PAGE_SIZE = 50
 
   fun initialize(context: Context) {
     if (initialized) return
@@ -324,14 +328,17 @@ object ImmichRepository {
     cancellationSignal: CancellationSignal? = null
   ): QueryResult {
     return try {
+      val startedAt = System.currentTimeMillis()
       val page = pageToken?.toIntOrNull() ?: 1
-      val requestSize = pageSize.coerceIn(1, API_PAGE_SIZE)
+      val requestSize = pageSize.coerceIn(1, SMART_SEARCH_PAGE_SIZE)
       val url = ApiClient.buildUrl("/search/smart") ?: return QueryResult(emptyList(), null)
       val body = JSONObject().apply {
         put("query", query)
         put("page", page)
         put("size", requestSize)
-        put("withExif", true)
+        // Search synchronization only consumes the asset ID and optional local
+        // URI. Full EXIF is already present in the Picker's synced media table.
+        put("withExif", false)
         put("visibility", "timeline")
         put("language", Locale.getDefault().toLanguageTag())
       }
@@ -353,6 +360,11 @@ object ImmichRepository {
           val items = assetsObj.optJSONArray("items") ?: JSONArray()
           val assets = mutableListOf<ImmichAsset>()
           for (i in 0 until items.length()) assets.add(assetFromApiJson(items.getJSONObject(i)))
+          Log.d(
+            TAG,
+            "Smart search page $page returned ${assets.size} assets in " +
+              "${System.currentTimeMillis() - startedAt} ms"
+          )
           QueryResult(assets, parseNextPage(assetsObj))
         }
       } finally {

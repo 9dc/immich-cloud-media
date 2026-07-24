@@ -47,6 +47,12 @@ three-second cloud-search window. In the picker, tap the `Immich: …` suggestio
 to run a provider-scoped search. Android currently displays cloud search matches
 by capture date rather than preserving Immich's relevance order.
 
+### Custom headers
+
+If your Immich server sits behind a reverse proxy that requires header-based
+authentication (Pangolin, Cloudflare Access, Authelia, etc.), you can add the
+required headers on the login screen — one per line, in `Name: value` format.
+
 ## Building from source
 
 ```sh

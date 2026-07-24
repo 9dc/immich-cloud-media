@@ -24,6 +24,7 @@ private const val KEY_SERVER_URL = "server_url"
 private const val KEY_ACCESS_TOKEN = "access_token"
 private const val KEY_API_KEY = "api_key"
 private const val KEY_ACCOUNT_NAME = "account_name"
+private const val KEY_CUSTOM_HEADERS = "custom_headers"
 
 object ApiClient {
   private const val CACHE_SIZE_BYTES = 100L * 1024 * 1024
@@ -45,6 +46,7 @@ object ApiClient {
         .addInterceptor { chain ->
           val original = chain.request()
           val builder = original.newBuilder()
+          customHeaders.forEach { (name, value) -> builder.header(name, value) }
           getApiKey()?.let { builder.header("x-api-key", it) }
           getAccessToken()?.let {
             builder.header("Cookie", "immich_access_token=$it; immich_is_authenticated=true")
@@ -69,6 +71,28 @@ object ApiClient {
   var accountName: String?
     get() = prefs.getString(KEY_ACCOUNT_NAME, null)
     set(value) = prefs.edit().putString(KEY_ACCOUNT_NAME, value).apply()
+
+  /**
+   * Custom headers plain text, one per line, formatted as "Name: value".
+   * Used for reverse proxies that require their own authentication
+   * (Pangolin, Cloudflare Access, Authelia, etc.).
+   */
+  var customHeadersRaw: String
+    get() = prefs.getString(KEY_CUSTOM_HEADERS, "") ?: ""
+    set(value) = prefs.edit().putString(KEY_CUSTOM_HEADERS, value).apply()
+
+  val customHeaders: Map<String, String>
+    get() = customHeadersRaw.lineSequence()
+      .mapNotNull { line ->
+        val trimmed = line.trim()
+        if (trimmed.isEmpty() || trimmed.startsWith("#")) return@mapNotNull null
+        val idx = trimmed.indexOf(':')
+        if (idx <= 0) return@mapNotNull null
+        val name = trimmed.substring(0, idx).trim()
+        val value = trimmed.substring(idx + 1).trim()
+        if (name.isEmpty() || value.isEmpty()) null else name to value
+      }
+      .toMap()
 
   val isLoggedIn: Boolean
     get() = serverUrl != null && (getAccessToken() != null || getApiKey() != null)

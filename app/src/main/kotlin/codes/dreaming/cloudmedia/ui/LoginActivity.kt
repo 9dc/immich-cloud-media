@@ -66,6 +66,8 @@ class LoginActivity : AppCompatActivity() {
         binding = ActivityLoginBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        binding.customHeadersInput.setText(ApiClient.customHeadersRaw)
+
         binding.toggleAuthMode.setOnClickListener {
             useApiKey = !useApiKey
             updateAuthModeUi()
@@ -215,6 +217,7 @@ class LoginActivity : AppCompatActivity() {
 
     private fun performLogin() {
         val serverUrl = binding.serverUrlInput.text?.toString()?.trim() ?: ""
+        ApiClient.customHeadersRaw = binding.customHeadersInput.text?.toString().orEmpty()
         if (serverUrl.isBlank()) {
             showError(getString(R.string.server_url_required))
             return
